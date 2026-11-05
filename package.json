@@ -1,0 +1,20 @@
+{
+  "name": "agentrouter-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Worker proxy with D1-backed session routing",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "setup": "node scripts/manage.mjs setup",
+    "secrets": "node scripts/manage.mjs secrets",
+    "build:d1": "python3 scripts/build-d1-init.py",
+    "test": "node --test worker.test.mjs scripts/manage.test.mjs",
+    "check": "node scripts/manage.mjs check",
+    "deploy": "node scripts/manage.mjs deploy",
+    "dev": "node scripts/manage.mjs dev",
+    "db:init": "node scripts/manage.mjs db:init",
+    "db:init:local": "node scripts/manage.mjs db:init:local",
+    "health": "node scripts/manage.mjs health"
+  },
+  "devDependencies": { "wrangler": "4.95.0" }
+}

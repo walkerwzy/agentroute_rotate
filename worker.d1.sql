@@ -1,0 +1,109 @@
+-- Run once on the D1 database bound to the Worker as DB.
+-- Safe to run again: existing state and counters are preserved.
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS proxy_stats (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  schema_version INTEGER NOT NULL,
+  session_requests INTEGER NOT NULL DEFAULT 0 CHECK (session_requests >= 0),
+  default_requests INTEGER NOT NULL DEFAULT 0 CHECK (default_requests >= 0),
+  created_at INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO proxy_stats (id, schema_version, created_at)
+VALUES (1, 1, CAST(strftime('%s', 'now') AS INTEGER) * 1000);
+
+-- No API key, prompt, response body, or raw session identifier is stored.
+CREATE TABLE IF NOT EXISTS proxy_key_state (
+  credential_hash TEXT PRIMARY KEY,
+  calls INTEGER NOT NULL DEFAULT 0 CHECK (calls >= 0),
+  success_calls INTEGER NOT NULL DEFAULT 0 CHECK (success_calls >= 0),
+  error_calls INTEGER NOT NULL DEFAULT 0 CHECK (error_calls >= 0),
+  cooldown_until INTEGER NOT NULL DEFAULT 0,
+  cooldown_reason TEXT,
+  cooldown_generation INTEGER NOT NULL DEFAULT 0,
+  last_error_at INTEGER,
+  last_error_status INTEGER,
+  last_error_message TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  CHECK (success_calls + error_calls <= calls)
+);
+
+CREATE TABLE IF NOT EXISTS proxy_requests (
+  id TEXT PRIMARY KEY,
+  source TEXT NOT NULL,
+  started_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS proxy_requests_started ON proxy_requests (started_at);
+
+CREATE TABLE IF NOT EXISTS proxy_attempts (
+  id TEXT PRIMARY KEY,
+  request_id TEXT NOT NULL REFERENCES proxy_requests (id),
+  credential_hash TEXT NOT NULL REFERENCES proxy_key_state (credential_hash),
+  key_name TEXT NOT NULL,
+  cooldown_generation INTEGER NOT NULL,
+  started_at INTEGER NOT NULL,
+  finished_at INTEGER,
+  outcome TEXT NOT NULL DEFAULT 'pending' CHECK (outcome IN ('pending', 'success', 'error')),
+  http_status INTEGER,
+  error_message TEXT,
+  cooldown_until INTEGER NOT NULL DEFAULT 0,
+  cooldown_reason TEXT,
+  routing_json TEXT NOT NULL CHECK (json_valid(routing_json))
+);
+CREATE INDEX IF NOT EXISTS proxy_attempts_started ON proxy_attempts (started_at);
+CREATE INDEX IF NOT EXISTS proxy_attempts_request ON proxy_attempts (request_id);
+CREATE INDEX IF NOT EXISTS proxy_attempts_pending
+  ON proxy_attempts (credential_hash, started_at) WHERE outcome = 'pending';
+
+-- Counts are updated by atomic SQL operations, never JavaScript read/modify/write.
+CREATE TRIGGER IF NOT EXISTS proxy_request_count
+AFTER INSERT ON proxy_requests
+BEGIN
+  UPDATE proxy_stats SET
+    session_requests = session_requests + (NEW.source <> 'default'),
+    default_requests = default_requests + (NEW.source = 'default')
+  WHERE id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS proxy_attempt_count
+AFTER INSERT ON proxy_attempts
+BEGIN
+  UPDATE proxy_key_state SET calls = calls + 1, updated_at = MAX(updated_at, NEW.started_at)
+  WHERE credential_hash = NEW.credential_hash;
+END;
+
+-- A parsed/adapted response can reclassify a provisional success as an error.
+-- Repeated INSERTs and repeated identical outcomes do not count twice.
+CREATE TRIGGER IF NOT EXISTS proxy_attempt_outcome
+AFTER UPDATE OF outcome ON proxy_attempts WHEN NEW.outcome <> OLD.outcome
+BEGIN
+  UPDATE proxy_key_state SET
+    success_calls = success_calls + (NEW.outcome = 'success') - (OLD.outcome = 'success'),
+    error_calls = error_calls + (NEW.outcome = 'error') - (OLD.outcome = 'error'),
+    last_error_status = CASE
+      WHEN NEW.outcome = 'error' AND NEW.finished_at >= COALESCE(last_error_at, 0)
+      THEN NEW.http_status ELSE last_error_status END,
+    last_error_message = CASE
+      WHEN NEW.outcome = 'error' AND NEW.finished_at >= COALESCE(last_error_at, 0)
+      THEN NEW.error_message ELSE last_error_message END,
+    last_error_at = CASE
+      WHEN NEW.outcome = 'error' AND NEW.finished_at >= COALESCE(last_error_at, 0)
+      THEN NEW.finished_at ELSE last_error_at END,
+    updated_at = MAX(updated_at, NEW.finished_at)
+  WHERE credential_hash = NEW.credential_hash;
+END;
+
+-- Only attempts in the current recovery generation can extend the cooldown.
+-- An old in-flight failure cannot disable a key after its next recovery phase.
+CREATE TRIGGER IF NOT EXISTS proxy_attempt_cooldown
+AFTER UPDATE OF outcome ON proxy_attempts
+WHEN NEW.outcome = 'error' AND OLD.outcome <> 'error' AND NEW.cooldown_until > 0
+BEGIN
+  UPDATE proxy_key_state SET
+    cooldown_reason = CASE WHEN NEW.cooldown_until >= cooldown_until
+      THEN NEW.cooldown_reason ELSE cooldown_reason END,
+    cooldown_until = MAX(cooldown_until, NEW.cooldown_until)
+  WHERE credential_hash = NEW.credential_hash
+    AND cooldown_generation = NEW.cooldown_generation;
+END;
